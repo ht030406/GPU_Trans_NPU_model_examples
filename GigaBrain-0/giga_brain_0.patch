@@ -1,0 +1,85 @@
+diff --git a/configs/gb07_pg2_pick_and_place_piper_30k.py b/configs/gb07_pg2_pick_and_place_piper_30k.py
+index 2d9f678..dbde1f8 100644
+--- a/configs/gb07_pg2_pick_and_place_piper_30k.py
++++ b/configs/gb07_pg2_pick_and_place_piper_30k.py
+@@ -228,7 +228,8 @@ config = dict(
+         mixed_precision="no",
+         checkpoint_interval=5000,
+         checkpoint_total_limit=2,
+-        dynamo_config=dict(backend="inductor"),
++        # torch.compile/inductor is unsupported on NPU (eager mode).
++        dynamo_config=None,
+         checkpoint_keeps=[10000, 20000, 30000],
+         checkpoint_safe_serialization=False,
+         checkpoint_strict=False,
+diff --git a/configs/gb07_pg2_push_buttons_h01_30k.py b/configs/gb07_pg2_push_buttons_h01_30k.py
+index b0b9fb1..f83791c 100644
+--- a/configs/gb07_pg2_push_buttons_h01_30k.py
++++ b/configs/gb07_pg2_push_buttons_h01_30k.py
+@@ -231,7 +231,8 @@ config = dict(
+         mixed_precision="no",
+         checkpoint_interval=5000,
+         checkpoint_total_limit=2,
+-        dynamo_config=dict(backend="inductor"),
++        # torch.compile/inductor is unsupported on NPU (eager mode).
++        dynamo_config=None,
+         checkpoint_keeps=[10000, 20000, 30000],
+         checkpoint_safe_serialization=False,
+         checkpoint_strict=False,
+diff --git a/giga_brain_0/giga_brain_0_trainer.py b/giga_brain_0/giga_brain_0_trainer.py
+index ac12635..aad78b4 100644
+--- a/giga_brain_0/giga_brain_0_trainer.py
++++ b/giga_brain_0/giga_brain_0_trainer.py
+@@ -11,6 +11,7 @@ from typing import Any
+ from accelerate import DistributedType
+ from accelerate.utils.dataclasses import FP8BackendType
+ import torch
++import torch_npu
+ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+     CheckpointImpl,
+     apply_activation_checkpointing as torch_apply_activation_checkpointing,
+@@ -28,6 +29,15 @@ from .giga_brain_0_loss import GigaBrain07Loss
+ from .lerobot_open_cache import WORKER_PROFILE_KEY, wrap_lerobot_open_cache
+ from .lightweight_shard_index import wrap_materialized_shard_reader
+ 
++# Ascend NPU / aarch64 workaround: torch's intra-op thread pool deadlocks in
++# forked DataLoader workers (post-fork parallel_for hang). Force single-threaded
++# torch ops so forked children never contend on the inherited pool. This must run
++# before any DataLoader is created (accelerate overrides OMP_NUM_THREADS with
++# --num_cpu_threads_per_process, so env vars alone are insufficient).
++os.environ['OMP_NUM_THREADS'] = '1'
++os.environ['MKL_NUM_THREADS'] = '1'
++torch.set_num_threads(1)
++
+ 
+ # Subset of train-time `transform` config that the inference server / rollout script
+ # need to reconstruct preprocess + postprocess. Anything that's purely a training
+diff --git a/requirements-paligemma2.txt b/requirements-paligemma2.txt
+index ea351a2..7eed11d 100644
+--- a/requirements-paligemma2.txt
++++ b/requirements-paligemma2.txt
+@@ -10,7 +10,7 @@ beautifulsoup4==4.12.3
+ calflops==0.3.2
+ compel==2.0.3
+ datasets==4.8.5
+-decord==0.6.0
++#decord==0.6.0
+ diffusers==0.34.0
+ einops==0.8.0
+ filelock==3.18.0
+@@ -44,11 +44,11 @@ segment-anything==1.0
+ tensorboard==2.19.0
+ terminaltables==3.1.10
+ timm==1.0.19
+-torch==2.7.1
+-torchcodec==0.5
+-torchvision==0.22.1
++#torch==2.7.1
++#torchcodec==0.5
++#torchvision==0.22.1
+ tqdm==4.67.1
+ transformers==4.54.1
+-triton==3.3.1
++#triton==3.3.1
+ typing-extensions==4.12.2
+ tyro==0.9.13

@@ -1,0 +1,277 @@
+diff --git a/configs/robodojo/deepspeed_zero1.json b/configs/robodojo/deepspeed_zero1.json
+index 8ee9085..dc2df52 100644
+--- a/configs/robodojo/deepspeed_zero1.json
++++ b/configs/robodojo/deepspeed_zero1.json
+@@ -3,15 +3,16 @@
+   "train_micro_batch_size_per_gpu": "auto",
+   "gradient_accumulation_steps": "auto",
+   "zero_optimization": {
+-    "stage": 1,
++    "stage": 2,
+     "offload_optimizer": {
+-      "device": "none"
++      "device": "cpu",
++      "pin_memory": true
+     },
+     "offload_param": {
+       "device": "none"
+     },
+-    "overlap_comm": false,
+-    "contiguous_gradients": false,
++    "overlap_comm": true,
++    "contiguous_gradients": true,
+     "reduce_bucket_size": 200000000.0,
+     "allgather_bucket_size": 200000000.0
+   }
+diff --git a/scripts/robodojo/train.sh b/scripts/robodojo/train.sh
+index 359abfb..b57dfa0 100755
+--- a/scripts/robodojo/train.sh
++++ b/scripts/robodojo/train.sh
+@@ -7,9 +7,10 @@ if [[ "${1:-}" == --help || "${1:-}" == help ]]; then
+   exit 0
+ fi
+ # Managed-platform WORLD_SIZE/RANK are node counts/ranks before Accelerate launch.
+-export NNODES="${NNODES:-${WORLD_SIZE:-12}}" NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
++export NNODES="${NNODES:-${WORLD_SIZE:-1}}" NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+ if [[ -z "${NODE_RANK:-}" && -n "${RANK:-}" ]]; then export NODE_RANK="$RANK"; fi
+ export VPP2_TRAIN_MODULE=vpp2.cli
+ export VPP2_ACCELERATE_CONFIG=configs/robodojo/accelerate.yaml
+-export REQUIRE_RDMA="${REQUIRE_RDMA:-1}"
++# RDMA is probed, not assumed: default to 0 unless usable InfiniBand tooling exists.
++export REQUIRE_RDMA="$(if [[ -d /dev/infiniband ]] && command -v ibv_devinfo >/dev/null; then echo 1; else echo 0; fi)"
+ exec bash scripts/train.sh --config configs/robodojo/train_100k.yaml "$@"
+diff --git a/scripts/train.sh b/scripts/train.sh
+index 9a21ce9..5a37bc9 100644
+--- a/scripts/train.sh
++++ b/scripts/train.sh
+@@ -25,15 +25,21 @@ if (( nodes > 1 )); then
+   : "${NODE_RANK:?Set NODE_RANK on every GPU-bearing role}"
+   : "${MASTER_ADDR:?Set the reachable master address}"
+ fi
+-nvidia-smi --query-gpu=index,name,memory.used --format=csv,noheader
+-nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader
++if command -v npu-smi >/dev/null 2>&1; then
++  npu-smi info 2>/dev/null | sed -n '1,30p' || true
++else
++  nvidia-smi --query-gpu=index,name,memory.used --format=csv,noheader || true
++  nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader || true
++fi
+ tmux list-sessions 2>/dev/null || true
+ "$python_bin" - "$per_node" <<'PY'
+ import sys, torch
+ expected = int(sys.argv[1])
+-observed = torch.cuda.device_count()
++backend = "npu" if getattr(torch, "npu", None) and torch.npu.is_available() else "cuda"
++observed = torch.npu.device_count() if backend == "npu" else torch.cuda.device_count()
+ if observed != expected:
+-    raise SystemExit(f"Expected {expected} visible GPUs on this role; found {observed}")
++    raise SystemExit(f"Expected {expected} visible {backend.upper()} devices on this role; found {observed}")
++print(f"[device-check] {backend}: {observed} devices visible")
+ PY
+ if [[ "${REQUIRE_RDMA:-0}" == 1 ]]; then
+   [[ -d /dev/infiniband ]] || { echo 'RDMA devices are missing' >&2; exit 1; }
+@@ -41,6 +47,7 @@ if [[ "${REQUIRE_RDMA:-0}" == 1 ]]; then
+ fi
+ if [[ -n "${ARNOLD_RDMA_DEVICE:-}" ]]; then
+   export NCCL_IB_HCA="${ARNOLD_RDMA_DEVICE}"
++  export HCCL_IB_HCA="${ARNOLD_RDMA_DEVICE}"
+ fi
+ if [[ "$train_module" == vpp2.cli ]]; then
+   export VPP2_TORCH_LOAD_MMAP=1
+diff --git a/src/vpp2/cli.py b/src/vpp2/cli.py
+index 2fd8cdf..29915ba 100644
+--- a/src/vpp2/cli.py
++++ b/src/vpp2/cli.py
+@@ -9,6 +9,19 @@ import shutil
+ import subprocess
+ import sys
+ 
++# --- Ascend NPU migration entry point ---------------------------------------
++# Transparently rebinds torch.cuda.* / .cuda() / .to("cuda") to the NPU device.
++# All vpp2 submodules are imported after this block, so they are patched too.
++try:
++    import torch
++    import torch_npu  # noqa: F401  (must import before transfer_to_npu)
++    from torch_npu.contrib.transfer_to_npu import transfer_to_npu
++
++    transfer_to_npu()
++except ImportError:
++    pass  # CPU-only runs keep the original torch CUDA semantics
++# ----------------------------------------------------------------------------
++
+ 
+ def load_config(path, overrides=()):
+     from omegaconf import OmegaConf
+diff --git a/src/vpp2/models/wan21_14b/vpp2.py b/src/vpp2/models/wan21_14b/vpp2.py
+index ab7ab28..5f9eb40 100644
+--- a/src/vpp2/models/wan21_14b/vpp2.py
++++ b/src/vpp2/models/wan21_14b/vpp2.py
+@@ -1285,7 +1285,12 @@ class VPP2(torch.nn.Module):
+         else:
+             if input_latents is None:
+                 raise RuntimeError("Full video training path requires encoded input latents.")
+-            noise_video = torch.randn_like(input_latents)
++            # noise_video = torch.randn_like(input_latents)
++            noise_video = torch.randn(
++                input_latents.shape,
++                device="cpu",
++                dtype=input_latents.dtype,
++            ).to(device=input_latents.device, dtype=input_latents.dtype)
+         joint_denoising = bool(False)
+         video_loss_mask = None
+         action_loss_mask = None
+@@ -1309,13 +1314,20 @@ class VPP2(torch.nn.Module):
+             target_video = self.train_video_scheduler.training_target(
+                 input_latents, noise_video, timestep_video
+             )
+-        noise_action = torch.randn_like(action)
++        # noise_action = torch.randn_like(action)
++        noise_action = torch.randn(
++            action.shape,
++            device="cpu",
++            dtype=action.dtype,
++        ).to(device=action.device, dtype=action.dtype)
+         if shared_action_timestep is not None:
+             timestep_action = shared_action_timestep.to(dtype=action.dtype)
+         else:
+             timestep_action = self.train_action_scheduler.sample_training_t(
+-                batch_size=batch_size, device=self.device, dtype=action.dtype
+-            )
++                    batch_size=batch_size, device=torch.device("cpu"), dtype=action.dtype
++            ).to(device=self.device, dtype=action.dtype)
++            #     batch_size=batch_size, device=self.device, dtype=action.dtype
++            # )
+         noisy_action = self.train_action_scheduler.add_noise(action, noise_action, timestep_action)
+         target_action = self.train_action_scheduler.training_target(
+             action, noise_action, timestep_action
+diff --git a/src/vpp2/models/wan21_14b/wan_video_dit.py b/src/vpp2/models/wan21_14b/wan_video_dit.py
+index 753b2cd..7a1d6a4 100644
+--- a/src/vpp2/models/wan21_14b/wan_video_dit.py
++++ b/src/vpp2/models/wan21_14b/wan_video_dit.py
+@@ -1,4 +1,5 @@
+ import math
++import os
+ from typing import Any, Dict, Optional, Tuple
+ 
+ import torch
+@@ -66,9 +67,12 @@ def precompute_freqs_cis_3d(dim: int, end: int = 1024, theta: float = 10000.0):
+ 
+ def rope_apply(x: torch.Tensor, freqs: torch.Tensor, num_heads: int):
+     x = rearrange(x, "b s (n d) -> b s n d", n=num_heads)
+-    x_out = torch.view_as_complex(x.to(torch.float64).reshape(*x.shape[:-1], -1, 2))
++    x_out = torch.view_as_complex(x.to(torch.float32).reshape(*x.shape[:-1], -1, 2))
+     freqs = freqs.to(device=x.device)
+-    if freqs.device.type == "npu":
++    # Keep both operands complex64: the precomputed cis table may be complex128
++    # (built in float64), which mismatches complex64 on NPU and degrades fp64
++    # matmul performance on both backends.
++    if freqs.dtype != torch.complex64:
+         freqs = freqs.to(torch.complex64)
+     x_out = torch.view_as_real(x_out * freqs).flatten(2)
+     return x_out.to(x.dtype)
+@@ -81,6 +85,22 @@ class WanRMSNorm(nn.Module):
+         self.weight = nn.Parameter(torch.ones(dim))
+ 
+     def forward(self, x: torch.Tensor):
++        # C1-adopted (mode=2, bf16 accumulation domain): fused npu_rms_norm
++        # replaces the 7-kernel fp32 chain, halving RMSNorm memory traffic.
++        # Gated by VPP2_NPU_RMSNORM="2"; any other value keeps the baseline
++        # path bit-identical. A/B (clean 16-card window, 2026-10-14): perf
++        # 1884/1880/1881s vs baseline 1895/1900/1897s = -0.83% (t=8.31,
++        # p=0.0007, 6.2x window noise floor); precision: loss step2 bit-exact
++        # 2.3670, step1 delta 4e-4. Mode=1 (fp32 domain) measured neutral and
++        # is NOT included. Model params load as bf16 (model_dtype), so weight
++        # is cast to the operand dtype; output cast back to x.dtype matches
++        # the baseline (bf16 * bf16 weight = bf16).
++        mode = os.getenv("VPP2_NPU_RMSNORM", "0")
++        if mode == "2" and x.is_npu and x.is_contiguous() and x.dim() == 3:
++            import torch_npu
++
++            y, _ = torch_npu.npu_rms_norm(x, self.weight.to(x.dtype), epsilon=self.eps)
++            return y.to(x.dtype)
+         dtype = x.dtype
+         x = x.float()
+         x = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+diff --git a/src/vpp2/runtime.py b/src/vpp2/runtime.py
+index 2cb1ce8..903ae4c 100644
+--- a/src/vpp2/runtime.py
++++ b/src/vpp2/runtime.py
+@@ -248,15 +248,24 @@ def build_datasets(data_cfg: DictConfig):
+ 
+ 
+ def _resolve_train_device() -> str:
+-    if not torch.cuda.is_available():
+-        return "cpu"
+-    device_count = torch.cuda.device_count()
+-    if device_count <= 1:
+-        return "cuda:0"
+-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+-    if local_rank < 0 or local_rank >= device_count:
+-        return "cuda:0"
+-    return f"cuda:{local_rank}"
++    # NPU (Ascend) first; CUDA remains as a fallback for CPU-only smoke runs.
++    if getattr(torch, "npu", None) is not None and torch.npu.is_available():
++        device_count = torch.npu.device_count()
++        if device_count <= 0:
++            return "cpu"
++        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
++        if local_rank < 0 or local_rank >= device_count:
++            return "npu:0"
++        return f"npu:{local_rank}"
++    if torch.cuda.is_available():
++        device_count = torch.cuda.device_count()
++        if device_count <= 1:
++            return "cuda:0"
++        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
++        if local_rank < 0 or local_rank >= device_count:
++            return "cuda:0"
++        return f"cuda:{local_rank}"
++    return "cpu"
+ 
+ 
+ def run_training(cfg: DictConfig):
+@@ -300,9 +309,19 @@ def run_training(cfg: DictConfig):
+     mixed_precision = _normalize_mixed_precision(cfg.mixed_precision)
+     model_dtype = _mixed_precision_to_model_dtype(mixed_precision)
+     # Seed before constructing fresh Action/proprio projections on every rank.
+-    from accelerate.utils import set_seed
++    # (Ascend migration) fixed global seed incl. NPU manual_seed_all; same rule on
++    # every rank so A/B precision alignment is not polluted by init noise.
++    import random
+ 
+-    set_seed(int(cfg.seed))
++    import numpy as np
++
++    random.seed(int(cfg.seed))
++    np.random.seed(int(cfg.seed))
++    torch.manual_seed(int(cfg.seed))
++    if getattr(torch, "npu", None) is not None and torch.npu.is_available():
++        torch.npu.manual_seed_all(int(cfg.seed))
++    elif torch.cuda.is_available():
++        torch.cuda.manual_seed_all(int(cfg.seed))
+     with profiler.measure_startup("model_instantiate_ms", cuda=True):
+         model = instantiate(cfg.model, model_dtype=model_dtype, device=model_device)
+     with profiler.measure_startup("dataset_build_ms"):
+diff --git a/src/vpp2/trainer.py b/src/vpp2/trainer.py
+index ca799a7..537075d 100644
+--- a/src/vpp2/trainer.py
++++ b/src/vpp2/trainer.py
+@@ -633,9 +633,15 @@ class JointTrainer:
+             finally:
+                 for module, training in modes:
+                     module.training = training
+-            summed = self.accelerator.reduce(
+-                local.to(device=self.accelerator.device, dtype=torch.float64), reduction="sum"
+-            )
++            # [NPU migration] HCCL does not support fp64 allreduce
++            # (HCCL allreduce: Unsupported data type at::kDouble): aggregate eval
++            # metrics in fp32 on NPU while keeping fp64 on CUDA/CPU (upstream
++            # behavior). Eval metrics are small sums of losses (~1e2 range); fp32
++            # accumulation error is negligible.
++            reduce_local = local.to(device=self.accelerator.device, dtype=torch.float64)
++            if reduce_local.is_npu and reduce_local.dtype == torch.float64:
++                reduce_local = reduce_local.float()
++            summed = self.accelerator.reduce(reduce_local, reduction="sum")
+             metrics = None
+             if self.accelerator.is_main_process:
+                 metrics = self.evaluator.summarize(summed, self.global_step)

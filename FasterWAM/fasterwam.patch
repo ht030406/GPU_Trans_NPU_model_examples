@@ -1,0 +1,174 @@
+diff --git a/pyproject.toml b/pyproject.toml
+index 823eaf3..3afb821 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -36,9 +36,6 @@ dependencies = [
+   "rich==14.2.0",
+   "safetensors==0.5.3",
+   "termcolor==2.5.0",
+-  "torch==2.7.1+cu128",
+-  "torchcodec==0.5",
+-  "torchvision==0.22.1+cu128",
+   "tqdm==4.66.5",
+   "transformers==4.49.0",
+   "typing-extensions==4.15.0",
+diff --git a/scripts/precompute_text_embeds.py b/scripts/precompute_text_embeds.py
+index 5c0836c..ab19b45 100644
+--- a/scripts/precompute_text_embeds.py
++++ b/scripts/precompute_text_embeds.py
+@@ -9,6 +9,7 @@ from typing import Any
+ 
+ import hydra
+ import torch
++import torch_npu
+ import torch.distributed as dist
+ from omegaconf import DictConfig, ListConfig
+ from tqdm import tqdm
+@@ -34,9 +35,15 @@ def _init_distributed():
+         return False, 0, 1, 0
+ 
+     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+-    backend = "nccl" if torch.cuda.is_available() else "gloo"
++    # backend = "nccl" if torch.cuda.is_available() else "gloo"
+     if torch.cuda.is_available():
++        backend = "nccl"
+         torch.cuda.set_device(local_rank)
++    elif torch_npu.npu.is_available():
++        backend = "hccl"
++        torch.npu.set_device(torch.device("npu",local_rank))
++    else:
++        backend = "gloo"
+ 
+     if not dist.is_initialized():
+         dist.init_process_group(backend=backend, init_method="env://")
+@@ -204,7 +211,10 @@ def main(cfg: DictConfig):
+         logger.warning("No prompts found from tasks.jsonl; nothing to do.")
+         return
+ 
+-    if torch.cuda.is_available():
++    if torch_npu.npu.is_available():
++        device = f"npu:{local_rank}" if is_distributed else "npu:0"
++        torch.npu.set_device(torch.device(device))
++    elif torch.cuda.is_available():
+         device = f"cuda:{local_rank}" if is_distributed else "cuda"
+     else:
+         device = "cpu"
+@@ -275,7 +285,7 @@ def main(cfg: DictConfig):
+         fully_cached_global = fully_cached_local
+         to_encode_global = len(prompts)
+         if is_distributed:
+-            reduce_device = torch.device(device) if device.startswith("cuda") else torch.device("cpu")
++            reduce_device = torch.device(device) if device.startswith(("cuda","npu")) else torch.device("cpu")
+             count_tensor = torch.tensor([fully_cached_local, len(prompts)], device=reduce_device, dtype=torch.long)
+             dist.all_reduce(count_tensor, op=dist.ReduceOp.SUM)
+             fully_cached_global = int(count_tensor[0].item())
+@@ -292,7 +302,7 @@ def main(cfg: DictConfig):
+     prompts_encoded_local = len(prompts)
+     prompts_encoded_global = prompts_encoded_local
+     if is_distributed:
+-        reduce_device = torch.device(device) if device.startswith("cuda") else torch.device("cpu")
++        reduce_device = torch.device(device) if device.startswith(("cuda","npu")) else torch.device("cpu")
+         count_tensor = torch.tensor([prompts_encoded_local], device=reduce_device, dtype=torch.long)
+         dist.all_reduce(count_tensor, op=dist.ReduceOp.SUM)
+         prompts_encoded_global = int(count_tensor.item())
+@@ -341,7 +351,7 @@ def main(cfg: DictConfig):
+ 
+     over_length_global = over_length_prompts
+     if is_distributed:
+-        reduce_device = torch.device(device) if device.startswith("cuda") else torch.device("cpu")
++        reduce_device = torch.device(device) if device.startswith(("cuda","npu")) else torch.device("cpu")
+         over_tensor = torch.tensor([over_length_prompts], device=reduce_device, dtype=torch.long)
+         dist.all_reduce(over_tensor, op=dist.ReduceOp.SUM)
+         over_length_global = int(over_tensor.item())
+diff --git a/src/fasterwam/models/wan22/wan_video_dit.py b/src/fasterwam/models/wan22/wan_video_dit.py
+index 2e7261c..6b6f106 100644
+--- a/src/fasterwam/models/wan22/wan_video_dit.py
++++ b/src/fasterwam/models/wan22/wan_video_dit.py
+@@ -1,4 +1,5 @@
+ import torch
++import torch_npu
+ import torch.nn as nn
+ import torch.nn.functional as F
+ import math
+@@ -144,18 +145,27 @@ def create_group_causal_attn_mask(
+     return attn_mask
+ 
+ 
++# class RMSNorm(nn.Module):
++#     def __init__(self, dim, eps=1e-5):
++#         super().__init__()
++#         self.eps = eps
++#         self.weight = nn.Parameter(torch.ones(dim))
++
++#     def norm(self, x):
++#         return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
++
++#     def forward(self, x):
++#         dtype = x.dtype
++#         return self.norm(x.float()).to(dtype) * self.weight
++
++# 替换融合算子
+ class RMSNorm(nn.Module):
+     def __init__(self, dim, eps=1e-5):
+         super().__init__()
+         self.eps = eps
+         self.weight = nn.Parameter(torch.ones(dim))
+-
+-    def norm(self, x):
+-        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+-
+     def forward(self, x):
+-        dtype = x.dtype
+-        return self.norm(x.float()).to(dtype) * self.weight
++        return torch_npu.npu_rms_norm(x, self.weight, epsilon=self.eps)[0]
+ 
+ 
+ class AttentionModule(nn.Module):
+diff --git a/src/fasterwam/runtime.py b/src/fasterwam/runtime.py
+index cade489..a1fa840 100644
+--- a/src/fasterwam/runtime.py
++++ b/src/fasterwam/runtime.py
+@@ -354,6 +354,18 @@ def build_datasets(data_cfg: DictConfig):
+ 
+ 
+ def _resolve_train_device() -> str:
++    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
++
++    if torch.npu.is_available():
++        device_count = torch.npu.device_count()
++        if device_count <= 0:
++            return "cpu"
++        if local_rank < 0 or local_rank >= device_count:
++            local_rank = 0
++        device = torch.device("npu", local_rank)
++        torch.npu.set_device(device)
++        return str(device)
++
+     if not torch.cuda.is_available():
+         return "cpu"
+     device_count = torch.cuda.device_count()
+diff --git a/src/fasterwam/trainer.py b/src/fasterwam/trainer.py
+index 75e0f2e..25439ab 100644
+--- a/src/fasterwam/trainer.py
++++ b/src/fasterwam/trainer.py
+@@ -9,6 +9,7 @@ import time
+ 
+ import numpy as np
+ import torch
++import torch_npu
+ from accelerate import Accelerator
+ from omegaconf import DictConfig
+ from PIL import Image
+diff --git a/src/fasterwam/utils/pytorch_utils.py b/src/fasterwam/utils/pytorch_utils.py
+index 87180a3..ad39215 100644
+--- a/src/fasterwam/utils/pytorch_utils.py
++++ b/src/fasterwam/utils/pytorch_utils.py
+@@ -30,6 +30,8 @@ def set_global_seed(seed: int, get_worker_init_fn: bool = False) -> Optional[Cal
+     torch.manual_seed(process_seed)
+     if torch.cuda.is_available():
+         torch.cuda.manual_seed_all(process_seed)
++    if torch.npu.is_available():
++        torch.npu.manual_seed_all(process_seed)
+ 
+     return worker_init_function if get_worker_init_fn else None
+ 

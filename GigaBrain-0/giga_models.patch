@@ -1,0 +1,141 @@
+diff --git a/giga_models/models/vla/giga_brain_0/modeling_giga_brain_0.py b/giga_models/models/vla/giga_brain_0/modeling_giga_brain_0.py
+index 15c1eeb..06195a9 100644
+--- a/giga_models/models/vla/giga_brain_0/modeling_giga_brain_0.py
++++ b/giga_models/models/vla/giga_brain_0/modeling_giga_brain_0.py
+@@ -1096,7 +1096,7 @@ class GigaBrain07Policy(ModelMixin, ConfigMixin):
+ 
+         # Embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
+         time_emb = create_sinusoidal_pos_embedding(timestep, self.proj_width, min_period=4e-3, max_period=4.0, device=device)
+-        time_emb = time_emb.type(dtype=dtype)
++        time_emb = time_emb.to(dtype=dtype)
+ 
+         # Time MLP (for adaRMS)
+         time_emb = self.time_mlp_in(time_emb)
+diff --git a/giga_models/models/vla/giga_brain_0/paligemma2_with_expert.py b/giga_models/models/vla/giga_brain_0/paligemma2_with_expert.py
+index 80de057..c00a97b 100644
+--- a/giga_models/models/vla/giga_brain_0/paligemma2_with_expert.py
++++ b/giga_models/models/vla/giga_brain_0/paligemma2_with_expert.py
+@@ -1,6 +1,7 @@
+ import math
+ 
+ import torch
++import torch_npu
+ from torch import nn
+ from transformers.activations import ACT2FN
+ from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling
+@@ -177,7 +178,7 @@ class SiglipVisionTransformer(nn.Module):
+ 
+         hidden_states = self.embeddings(pixel_values, interpolate_pos_encoding=interpolate_pos_encoding)
+         hidden_states = hidden_states.to(dtype=torch.bfloat16)
+-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
++        with torch.autocast(device_type='npu' if torch_npu.npu.is_available() else 'cuda', dtype=torch.bfloat16):
+             encoder_outputs: BaseModelOutput = self.encoder(
+                 inputs_embeds=hidden_states,
+                 output_attentions=output_attentions,
+@@ -244,7 +245,7 @@ class SiglipVisionTransformer(nn.Module):
+         encoder_states = () if output_hidden_states else None
+         all_attentions = () if output_attentions else None
+ 
+-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
++        with torch.autocast(device_type='npu' if torch_npu.npu.is_available() else 'cuda', dtype=torch.bfloat16):
+             for layer_idx, encoder_layer in enumerate(self.encoder.layers):
+                 if output_hidden_states:
+                     encoder_states = encoder_states + (hidden_states[:, -1],)
+@@ -311,7 +312,7 @@ class SiglipVisionTransformer(nn.Module):
+             history_states = history_states + full_pos_emb[:, :-1]
+             history_states = history_states.to(dtype=torch.bfloat16)
+ 
+-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
++            with torch.autocast(device_type='npu' if torch_npu.npu.is_available() else 'cuda', dtype=torch.bfloat16):
+                 for layer_idx, encoder_layer in enumerate(self.encoder.layers):
+                     if layer_idx % self.temporal_attention_interval == 0:
+                         cached_history_states.append(history_states)
+@@ -335,7 +336,7 @@ class SiglipVisionTransformer(nn.Module):
+         # (pos_emb is normalized to subtract the last frame), so no add needed.
+         hidden_states = hidden_states.to(dtype=torch.bfloat16)
+ 
+-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
++        with torch.autocast(device_type='npu' if torch_npu.npu.is_available() else 'cuda', dtype=torch.bfloat16):
+             cache_iter = iter(cached_history_states)
+             for layer_idx, encoder_layer in enumerate(self.encoder.layers):
+                 if layer_idx % self.temporal_attention_interval == 0:
+@@ -1105,7 +1106,7 @@ class PaliGemma2WithExpertModel(nn.Module):
+             adarms_cond = [None, None]
+         inputs_embeds = [input_embed.to(dtype=torch.bfloat16) if input_embed is not None else None for input_embed in inputs_embeds]
+ 
+-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
++        with torch.autocast(device_type='npu' if torch_npu.npu.is_available() else 'cuda', dtype=torch.bfloat16):
+             if use_cache and past_key_values is None:
+                 past_key_values = {}
+ 
+diff --git a/giga_models/models/vla/giga_brain_0/paligemma_with_expert.py b/giga_models/models/vla/giga_brain_0/paligemma_with_expert.py
+index 84c6684..8c86a1e 100644
+--- a/giga_models/models/vla/giga_brain_0/paligemma_with_expert.py
++++ b/giga_models/models/vla/giga_brain_0/paligemma_with_expert.py
+@@ -1,4 +1,5 @@
+ import torch
++import torch_npu
+ import torch.nn.functional as F
+ from torch import nn
+ from transformers.activations import ACT2FN
+@@ -98,7 +99,7 @@ class SiglipVisionTransformer(nn.Module):
+ 
+         hidden_states = self.embeddings(pixel_values, interpolate_pos_encoding=interpolate_pos_encoding)
+         hidden_states = hidden_states.to(dtype=torch.bfloat16)
+-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
++        with torch.autocast(device_type='npu' if torch_npu.npu.is_available() else 'cuda', dtype=torch.bfloat16):
+             encoder_outputs: BaseModelOutput = self.encoder(
+                 inputs_embeds=hidden_states,
+                 output_attentions=output_attentions,
+@@ -700,7 +701,7 @@ class PaliGemmaWithExpertModel(nn.Module):
+             adarms_cond = [None, None]
+         inputs_embeds = [input_embed.to(dtype=torch.bfloat16) if input_embed is not None else None for input_embed in inputs_embeds]
+ 
+-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
++        with torch.autocast(device_type='npu' if torch_npu.npu.is_available() else 'cuda', dtype=torch.bfloat16):
+             if use_cache and past_key_values is None:
+                 past_key_values = {}
+ 
+diff --git a/giga_models/models/vla/pi0/modeling_pi0.py b/giga_models/models/vla/pi0/modeling_pi0.py
+index cb40152..69c51c0 100644
+--- a/giga_models/models/vla/pi0/modeling_pi0.py
++++ b/giga_models/models/vla/pi0/modeling_pi0.py
+@@ -316,7 +316,7 @@ class PI0Policy(ModelMixin, ConfigMixin):
+ 
+         # Embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
+         time_emb = create_sinusoidal_pos_embedding(timestep, self.proj_width, min_period=4e-3, max_period=4.0, device=device)
+-        time_emb = time_emb.type(dtype=dtype)
++        time_emb = time_emb.to(dtype=dtype)
+ 
+         if self.pi05_enabled:
+             # time MLP (for adaRMS)
+diff --git a/giga_models/models/vla/pi0/paligemma_with_expert.py b/giga_models/models/vla/pi0/paligemma_with_expert.py
+index 46136e8..8e36533 100644
+--- a/giga_models/models/vla/pi0/paligemma_with_expert.py
++++ b/giga_models/models/vla/pi0/paligemma_with_expert.py
+@@ -1,6 +1,7 @@
+ from typing import List, Optional, Tuple
+ 
+ import torch
++import torch_npu
+ import torch.nn.functional as F
+ from torch import nn
+ from transformers.activations import ACT2FN
+@@ -101,7 +102,7 @@ class SiglipVisionTransformer(nn.Module):
+ 
+         hidden_states = self.embeddings(pixel_values, interpolate_pos_encoding=interpolate_pos_encoding)
+         hidden_states = hidden_states.to(dtype=torch.bfloat16)
+-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
++        with torch.autocast(device_type='npu' if torch_npu.npu.is_available() else 'cuda', dtype=torch.bfloat16):
+             encoder_outputs: BaseModelOutput = self.encoder(
+                 inputs_embeds=hidden_states,
+                 output_attentions=output_attentions,
+@@ -642,7 +643,7 @@ class PaliGemmaWithExpertModel(nn.Module):
+         """
+         inputs_embeds = [input_embed.to(dtype=torch.bfloat16) if input_embed is not None else None for input_embed in inputs_embeds]
+ 
+-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
++        with torch.autocast(device_type='npu' if torch_npu.npu.is_available() else 'cuda', dtype=torch.bfloat16):
+             if use_cache and past_key_values is None:
+                 past_key_values = {}
+ 
